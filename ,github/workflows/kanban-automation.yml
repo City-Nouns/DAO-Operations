@@ -1,0 +1,189 @@
+name: Kanban Board Automation
+
+on:
+  issues:
+    types: [opened, labeled, unlabeled]
+  pull_request:
+    types: [opened, labeled, unlabeled, closed]
+
+jobs:
+  manage_project_cards:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get project data
+        uses: actions/github-script@v6
+        id: get-project
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            // Find the DAO Operations project board
+            const projects = await github.rest.projects.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo
+            });
+            
+            const daoProject = projects.data.find(p => p.name === 'DAO Operations');
+            if (!daoProject) {
+              console.log('No DAO Operations project found');
+              return {project_id: null, columns: []};
+            }
+            
+            // Get columns
+            const columns = await github.rest.projects.listColumns({
+              project_id: daoProject.id
+            });
+            
+            const columnMap = {};
+            columns.data.forEach(column => {
+              columnMap[column.name] = column.id;
+            });
+            
+            return {
+              project_id: daoProject.id,
+              columns: columnMap
+            };
+
+      - name: Manage cards based on labels
+        if: ${{ steps.get-project.outputs.result != '' }}
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const projectData = ${{ steps.get-project.outputs.result }};
+            if (!projectData.project_id) {
+              return console.log('No project data available');
+            }
+            
+            const event = context.payload;
+            const columns = projectData.columns;
+            
+            // Map labels to columns
+            const labelToColumn = {
+              'status:needs-review': 'To Review',
+              'status:in-testing': 'Testing',
+              'status:security-audit': 'Security Review',
+              'status:ready-for-vote': 'Ready for Vote'
+            };
+            
+            // For new issues/PRs
+            if (event.action === 'opened') {
+              // Default column is "To Do"
+              const defaultColumn = columns['To Do'] || Object.values(columns)[0];
+              
+              let contentType, contentId;
+              if (event.issue) {
+                contentType = 'Issue';
+                contentId = event.issue.id;
+              } else if (event.pull_request) {
+                contentType = 'PullRequest';
+                contentId = event.pull_request.id;
+              }
+              
+              if (contentType && contentId) {
+                await github.rest.projects.createCard({
+                  column_id: defaultColumn,
+                  content_id: contentId,
+                  content_type: contentType
+                });
+                console.log(`Created card for ${contentType} #${contentId} in default column`);
+              }
+            }
+            
+            // For labeled/unlabeled events
+            if (['labeled', 'unlabeled'].includes(event.action)) {
+              let item, labels;
+              if (event.issue) {
+                item = event.issue;
+                labels = item.labels;
+              } else if (event.pull_request) {
+                item = event.pull_request;
+                labels = item.labels;
+              }
+              
+              if (item && labels) {
+                // Find the highest priority status label
+                const statusLabels = labels
+                  .filter(label => label.name.startsWith('status:'))
+                  .map(label => label.name);
+                
+                let targetColumn = null;
+                for (const statusLabel of statusLabels) {
+                  const columnName = labelToColumn[statusLabel];
+                  if (columnName && columns[columnName]) {
+                    targetColumn = columns[columnName];
+                    break;
+                  }
+                }
+                
+                if (targetColumn) {
+                  // Find existing card
+                  const cards = await github.paginate(
+                    github.rest.projects.listCards,
+                    {
+                      column_id: Object.values(columns)[0]
+                    }
+                  );
+                  
+                  let card = null;
+                  for (const col of Object.values(columns)) {
+                    const colCards = await github.paginate(
+                      github.rest.projects.listCards,
+                      { column_id: col }
+                    );
+                    
+                    const foundCard = colCards.find(c => {
+                      return c.content_url && c.content_url.includes(`/${item.number}`);
+                    });
+                    
+                    if (foundCard) {
+                      card = foundCard;
+                      break;
+                    }
+                  }
+                  
+                  if (card) {
+                    // Move card to target column
+                    await github.rest.projects.moveCard({
+                      card_id: card.id,
+                      position: 'top',
+                      column_id: targetColumn
+                    });
+                    console.log(`Moved card to ${Object.keys(columns).find(k => columns[k] === targetColumn)} column`);
+                  }
+                }
+              }
+            }
+            
+            // For closed PRs
+            if (event.action === 'closed' && event.pull_request) {
+              const doneColumn = columns['Done'];
+              if (doneColumn) {
+                // Find the card for this PR
+                let card = null;
+                for (const col of Object.values(columns)) {
+                  const colCards = await github.paginate(
+                    github.rest.projects.listCards,
+                    { column_id: col }
+                  );
+                  
+                  const foundCard = colCards.find(c => {
+                    return c.content_url && c.content_url.includes(`/${event.pull_request.number}`);
+                  });
+                  
+                  if (foundCard) {
+                    card = foundCard;
+                    break;
+                  }
+                }
+                
+                if (card) {
+                  // Move card to Done column
+                  await github.rest.projects.moveCard({
+                    card_id: card.id,
+                    position: 'top',
+                    column_id: doneColumn
+                  });
+                  console.log(`Moved closed PR card to Done column`);
+                }
+              }
+            }
